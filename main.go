@@ -3,13 +3,15 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"io/ioutil"
 	_ "log"
 
-	simplejson "github.com/bitly/go-simplejson"
+	//simplejson "github.com/bitly/go-simplejson"
 	"github.com/blevesearch/bleve"
 	"github.com/blevesearch/bleve/analysis/analyzers/custom_analyzer"
+	"github.com/blevesearch/bleve/document"
 	"github.com/gin-gonic/gin"
 	_ "github.com/semua/jiebago/tokenizers"
 )
@@ -202,10 +204,44 @@ func Doc(c *gin.Context) {
 		c.JSON(400, gin.H{"status": "Error opening document"})
 		return
 	}
-	jsonObj := simplejson.New()
-	for _, field := range doc.Fields {
-		jsonObj.Set(field.Name(), string(field.Value()))
+
+	rv := struct {
+		ID     string                 `json:"id"`
+		Fields map[string]interface{} `json:"fields"`
+	}{
+		ID:     docId,
+		Fields: map[string]interface{}{},
 	}
-	response, _ := jsonObj.Map()
-	c.JSON(200, response)
+	for _, field := range doc.Fields {
+		var newval interface{}
+		switch field := field.(type) {
+		case *document.TextField:
+			newval = string(field.Value())
+		case *document.NumericField:
+			n, err := field.Number()
+			if err == nil {
+				newval = n
+			}
+		case *document.DateTimeField:
+			d, err := field.DateTime()
+			if err == nil {
+				newval = d.Format(time.RFC3339Nano)
+			}
+		}
+		existing, existed := rv.Fields[field.Name()]
+		if existed {
+			switch existing := existing.(type) {
+			case []interface{}:
+				rv.Fields[field.Name()] = append(existing, newval)
+			case interface{}:
+				arr := make([]interface{}, 2)
+				arr[0] = existing
+				arr[1] = newval
+				rv.Fields[field.Name()] = arr
+			}
+		} else {
+			rv.Fields[field.Name()] = newval
+		}
+	}
+	c.JSON(200, rv)
 }
