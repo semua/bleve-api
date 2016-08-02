@@ -2,42 +2,83 @@ package main
 
 import (
 	"encoding/json"
-	_ "fmt"
-	"github.com/blevesearch/bleve"
-	"github.com/gin-gonic/gin"
-	//"github.com/gin-gonic/gin/binding"
+	"fmt"
+
 	"io/ioutil"
 	_ "log"
+
+	simplejson "github.com/bitly/go-simplejson"
+	"github.com/blevesearch/bleve"
+	"github.com/blevesearch/bleve/analysis/analyzers/custom_analyzer"
+	"github.com/gin-gonic/gin"
+	_ "github.com/semua/jiebago/tokenizers"
 )
 
+var IndexPool map[string]bleve.Index
+
 func main() {
+	IndexPool = make(map[string]bleve.Index)
 	r := gin.Default()
 	r.POST("/api/search/:index", Search)
+	r.GET("/api/doc/:index/:docId", Doc)
 	r.POST("/api/index/:index/:docId", Index)
 	r.PUT("/api/update/:index/:docId", Index)
 	r.DELETE("/api/delete/:index/:docId", Delete)
-	r.Run(":8080")
+	r.Run(":9089")
+
+	defer func() {
+		for _, index := range IndexPool {
+			if index != nil {
+				index.Close()
+			}
+		}
+	}()
+
+}
+
+func NewMapping() *bleve.IndexMapping {
+	mapping := bleve.NewIndexMapping()
+	err := mapping.AddCustomTokenizer("jieba",
+		map[string]interface{}{
+			"file":   "jieba_dict/dict.txt",
+			"type":   "jieba",
+			"hmm":    true,
+			"search": true,
+		})
+	if err != nil {
+		fmt.Println("AddCustomTokenizer error:", err)
+	}
+	err = mapping.AddCustomAnalyzer("jieba",
+		map[string]interface{}{
+			"type":      custom_analyzer.Name,
+			"tokenizer": "jieba",
+			"token_filters": []string{
+				"possessive_en",
+				"to_lower",
+				"stop_en",
+			},
+		})
+	if err != nil {
+		fmt.Println("AddCustomAnalyzer jieba error:", err)
+	}
+	mapping.DefaultAnalyzer = "jieba"
+	return mapping
 }
 
 func Index(c *gin.Context) {
-	var index bleve.Index
 	indexName := c.Params.ByName("index")
-	index, err := bleve.Open(indexName)
-
-	if err != nil {
-		mapping := bleve.NewIndexMapping()
-		index, err = bleve.New(indexName, mapping)
+	_, ok := IndexPool[indexName]
+	if !ok {
+		index, err := bleve.Open(indexName)
 		if err != nil {
-			c.JSON(400, gin.H{"status": "Opening index error"})
-			return
+			index, err = bleve.New(indexName, NewMapping())
+			if err != nil {
+				c.JSON(400, gin.H{"status": "Opening index error"})
+				return
+			}
 		}
+		IndexPool[indexName] = index
 	}
-
-	defer func() {
-		if index != nil {
-			index.Close()
-		}
-	}()
 
 	docId := c.Params.ByName("docId")
 	if docId == "" {
@@ -52,7 +93,7 @@ func Index(c *gin.Context) {
 		c.JSON(400, gin.H{"status": "Error reading body"})
 		return
 	}
-
+	fmt.Println(string(requestBody))
 	err = json.Unmarshal(requestBody, &form)
 
 	if err != nil {
@@ -60,7 +101,7 @@ func Index(c *gin.Context) {
 		return
 	}
 
-	err = index.Index(docId, form)
+	err = IndexPool[indexName].Index(docId, form)
 	if err != nil {
 		c.JSON(400, gin.H{"status": "Error indexing document"})
 		return
@@ -71,18 +112,15 @@ func Index(c *gin.Context) {
 
 func Search(c *gin.Context) {
 	indexName := c.Params.ByName("index")
-	index, err := bleve.Open(indexName)
-
-	if err != nil {
-		c.JSON(400, gin.H{"status": "Error opening index"})
-		return
-	}
-
-	defer func() {
-		if index != nil {
-			index.Close()
+	_, ok := IndexPool[indexName]
+	if !ok {
+		index, err := bleve.Open(indexName)
+		if err != nil {
+			c.JSON(400, gin.H{"status": "Error opening index"})
+			return
 		}
-	}()
+		IndexPool[indexName] = index
+	}
 
 	requestBody, err := ioutil.ReadAll(c.Request.Body)
 	if err != nil {
@@ -91,9 +129,11 @@ func Search(c *gin.Context) {
 	}
 
 	var searchRequest bleve.SearchRequest
+	fmt.Println(string(requestBody))
 	err = json.Unmarshal(requestBody, &searchRequest)
 
 	if err != nil {
+		fmt.Println(err)
 		c.JSON(400, gin.H{"status": "Error parsing query"})
 		return
 	}
@@ -104,51 +144,68 @@ func Search(c *gin.Context) {
 		return
 	}
 
-	searchResponse, err := index.Search(&searchRequest)
+	searchResponse, err := IndexPool[indexName].Search(&searchRequest)
 	if err != nil {
 		c.JSON(400, gin.H{"status": "Error executing the query"})
 		return
 	}
 
 	reply := make([]string, 0)
-
-	//query := bleve.NewFuzzyQuery("blve")
-	//searchRequest := bleve.NewSearchRequest(query)
-	//searchResponse, _ := index.Search(searchRequest)
-
 	for _, r := range searchResponse.Hits {
 		reply = append(reply, r.ID)
 	}
-
-	response, err := json.Marshal(&reply)
-	c.JSON(200, gin.H{"status": string(response[:])})
+	c.JSON(200, gin.H{"status": reply})
 }
 
 func Delete(c *gin.Context) {
 	indexName := c.Params.ByName("index")
-	index, err := bleve.Open(indexName)
-
-	if err != nil {
-		c.JSON(400, gin.H{"status": "Error opening index"})
-		return
-	}
-
-	defer func() {
-		if index != nil {
-			index.Close()
+	_, ok := IndexPool[indexName]
+	if !ok {
+		index, err := bleve.Open(indexName)
+		if err != nil {
+			c.JSON(400, gin.H{"status": "Error opening index"})
+			return
 		}
-	}()
-
+		IndexPool[indexName] = index
+	}
 	docId := c.Params.ByName("docId")
 	if docId == "" {
 		c.JSON(400, gin.H{"status": "Missing id"})
 		return
 	}
 
-	err = index.Delete(docId)
+	err := IndexPool[indexName].Delete(docId)
 	if err != nil {
 		c.JSON(400, gin.H{"status": "Error deleting document"})
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
+}
+func Doc(c *gin.Context) {
+	indexName := c.Params.ByName("index")
+	_, ok := IndexPool[indexName]
+	if !ok {
+		index, err := bleve.Open(indexName)
+		if err != nil {
+			c.JSON(400, gin.H{"status": "Error opening index"})
+			return
+		}
+		IndexPool[indexName] = index
+	}
+	docId := c.Params.ByName("docId")
+	if docId == "" {
+		c.JSON(400, gin.H{"status": "Missing id"})
+		return
+	}
+	doc, err := IndexPool[indexName].Document(docId)
+	if err != nil {
+		c.JSON(400, gin.H{"status": "Error opening document"})
+		return
+	}
+	jsonObj := simplejson.New()
+	for _, field := range doc.Fields {
+		jsonObj.Set(field.Name(), string(field.Value()))
+	}
+	response, _ := jsonObj.Map()
+	c.JSON(200, response)
 }
