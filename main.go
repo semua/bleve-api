@@ -1,14 +1,18 @@
 package main
 
 import (
+	"container/list"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"io/ioutil"
-	_ "log"
+	"log"
 
-	//simplejson "github.com/bitly/go-simplejson"
+	simplejson "github.com/bitly/go-simplejson"
 	"github.com/blevesearch/bleve"
 	"github.com/blevesearch/bleve/analysis/analyzers/custom_analyzer"
 	"github.com/blevesearch/bleve/document"
@@ -18,15 +22,30 @@ import (
 
 var IndexPool map[string]bleve.Index
 
+const baseDir = "index"
+
+type FieldMap struct {
+	ID     string                 `json:"id"`
+	Fields map[string]interface{} `json:"fields"`
+}
+
 func main() {
 	IndexPool = make(map[string]bleve.Index)
 	r := gin.Default()
 	r.POST("/api/search/:index", Search)
 	r.GET("/api/doc/:index/:docId", Doc)
+	r.GET("/api/list/:index", DocList)
 	r.POST("/api/index/:index/:docId", Index)
 	r.PUT("/api/update/:index/:docId", Index)
 	r.DELETE("/api/delete/:index/:docId", Delete)
-	r.Run(":9089")
+
+	go func() {
+		r.Run(":9089")
+	}()
+
+	admin := gin.Default()
+	admin.GET("/admin/shutdown", Shutdown)
+	admin.Run(":9088")
 
 	defer func() {
 		for _, index := range IndexPool {
@@ -35,9 +54,13 @@ func main() {
 			}
 		}
 	}()
-
 }
-
+func Shutdown(c *gin.Context) {
+	c.JSON(200, gin.H{"status": "shutdown after 10s."})
+	time.AfterFunc(time.Second*10, func() {
+		os.Exit(0)
+	})
+}
 func NewMapping() *bleve.IndexMapping {
 	mapping := bleve.NewIndexMapping()
 	err := mapping.AddCustomTokenizer("jieba",
@@ -71,9 +94,9 @@ func Index(c *gin.Context) {
 	indexName := c.Params.ByName("index")
 	_, ok := IndexPool[indexName]
 	if !ok {
-		index, err := bleve.Open(indexName)
+		index, err := bleve.Open(baseDir + "/" + indexName)
 		if err != nil {
-			index, err = bleve.New(indexName, NewMapping())
+			index, err = bleve.New(baseDir+"/"+indexName, NewMapping())
 			if err != nil {
 				c.JSON(400, gin.H{"status": "Opening index error"})
 				return
@@ -116,7 +139,7 @@ func Search(c *gin.Context) {
 	indexName := c.Params.ByName("index")
 	_, ok := IndexPool[indexName]
 	if !ok {
-		index, err := bleve.Open(indexName)
+		index, err := bleve.Open(baseDir + "/" + indexName)
 		if err != nil {
 			c.JSON(400, gin.H{"status": "Error opening index"})
 			return
@@ -163,7 +186,7 @@ func Delete(c *gin.Context) {
 	indexName := c.Params.ByName("index")
 	_, ok := IndexPool[indexName]
 	if !ok {
-		index, err := bleve.Open(indexName)
+		index, err := bleve.Open(baseDir + "/" + indexName)
 		if err != nil {
 			c.JSON(400, gin.H{"status": "Error opening index"})
 			return
@@ -187,7 +210,7 @@ func Doc(c *gin.Context) {
 	indexName := c.Params.ByName("index")
 	_, ok := IndexPool[indexName]
 	if !ok {
-		index, err := bleve.Open(indexName)
+		index, err := bleve.Open(baseDir + "/" + indexName)
 		if err != nil {
 			c.JSON(400, gin.H{"status": "Error opening index"})
 			return
@@ -204,12 +227,20 @@ func Doc(c *gin.Context) {
 		c.JSON(400, gin.H{"status": "Error opening document"})
 		return
 	}
+	resultJson := simplejson.New()
+	resultJson.Set("doc", parseDoc(doc))
+	resultJson.Set("status", "ok")
+	if c.Request.FormValue("callback") != "" {
+		jsonBytes, _ := resultJson.MarshalJSON()
+		c.String(200, c.Request.FormValue("callback")+"(%s);", string(jsonBytes))
+	} else {
+		c.JSON(200, resultJson.Interface())
+	}
+}
 
-	rv := struct {
-		ID     string                 `json:"id"`
-		Fields map[string]interface{} `json:"fields"`
-	}{
-		ID:     docId,
+func parseDoc(doc *document.Document) FieldMap {
+	rv := FieldMap{
+		ID:     doc.ID,
 		Fields: map[string]interface{}{},
 	}
 	for _, field := range doc.Fields {
@@ -243,5 +274,66 @@ func Doc(c *gin.Context) {
 			rv.Fields[field.Name()] = newval
 		}
 	}
-	c.JSON(200, rv)
+	return rv
+}
+
+func DocList(c *gin.Context) {
+	indexName := c.Params.ByName("index")
+	_, ok := IndexPool[indexName]
+	if !ok {
+		index, err := bleve.Open(baseDir + "/" + indexName)
+		if err != nil {
+			c.JSON(400, gin.H{"status": "Error opening index"})
+			return
+		}
+		IndexPool[indexName] = index
+	}
+	start := c.Request.FormValue("start")
+	if strings.TrimSpace(start) == "" {
+		start = "0"
+	}
+	startInt, err := strconv.Atoi(start)
+	if err != nil {
+		startInt = 0
+	}
+	limit := c.Request.FormValue("limit")
+	if strings.TrimSpace(limit) == "" {
+		limit = "20"
+	}
+	limitInt, err := strconv.Atoi(limit)
+	if err != nil {
+		limitInt = 20
+	}
+	docCount, _ := IndexPool[indexName].DocCount()
+	query := bleve.NewMatchAllQuery()
+	searchRequest := bleve.NewSearchRequest(query)
+	searchRequest.Size = limitInt
+	searchRequest.From = int(docCount) - limitInt - startInt
+	searchResults, err := IndexPool[indexName].Search(searchRequest)
+	if err != nil {
+		panic(err)
+	}
+	result := list.New()
+	for _, hits := range searchResults.Hits {
+		doc, _ := IndexPool[indexName].Document(hits.ID)
+		docMap := parseDoc(doc)
+		result.PushFront(docMap)
+	}
+	var resultArray []interface{}
+	for e := result.Front(); e != nil; e = e.Next() {
+		resultArray = append(resultArray, e.Value)
+	}
+
+	resultJson := simplejson.New()
+	resultJson.Set("docs", resultArray)
+	resultJson.Set("status", "ok")
+	resultJson.Set("count", result.Len())
+	log.Println("callback:", c.Request.FormValue("callback"))
+
+	if c.Request.FormValue("callback") != "" {
+		jsonBytes, _ := resultJson.MarshalJSON()
+		c.String(200, c.Request.FormValue("callback")+"(%s);", string(jsonBytes))
+	} else {
+		c.JSON(200, resultJson.Interface())
+	}
 }
